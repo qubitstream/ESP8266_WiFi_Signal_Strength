@@ -1,23 +1,24 @@
 /*
-A WiFi signal strength tracker sketch for ESP8266 based devices
-Requires a 128x32 OLED display and a potentiometer
- 
-Copyright (C) 2017 Christoph Haunschmidt
+  A WiFi signal strength tracker sketch for ESP8266 based devices
+  Requires a 128x32 OLED display and a potentiometer
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
+  Copyright (C) 2017 Christoph Haunschmidt
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+  This program is free software; you can redistribute it and/or
+  modify it under the terms of the GNU General Public License
+  as published by the Free Software Foundation; either version 2
+  of the License, or (at your option) any later version.
 
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
+#include <vector>
 #include <SPI.h>
 #include <ESP8266WiFi.h>
 #include <Adafruit_SSD1306.h>
@@ -27,6 +28,8 @@ const int WIDTH = 128;
 const int HEIGHT = 32;
 const unsigned char ANALOG_PIN = 0,
                     OLED_RESET = LED_BUILTIN;
+const unsigned char DATAPOINTS_PER_SECOND = 10;
+const unsigned char SELECTABLE_TIMESPANS[] = {1, 3, 5, 10, 30, 60};
 
 
 unsigned char dBmToPercent(long dBm) {
@@ -44,37 +47,44 @@ unsigned char dBmToPercent(long dBm) {
 class RSSIData {
   private:
     long current_rssi = 0;
-    unsigned int data_points_count = 0,
+    long current_rssi_cumulative = 0;
+    unsigned int current_rssi_cumulative_data_points_count = 0,
+                 data_points_count = 0,
                  data_points_available = 0,
                  data_points_position = 0,
                  update_every_ms = 100;
     unsigned long last_update_ms = 0,
                   next_update_due_ms = millis();
     unsigned char timespan_for_average_secs = 5;
-    long* data_points;
+    long* data_points = nullptr;
 
   public:
-    RSSIData(unsigned int data_points_count, unsigned char seconds_for_average);
+    RSSIData(unsigned char seconds_for_average);
     ~RSSIData() {
-      delete [] data_points;
+      if (data_points) delete [] data_points;
     };
     float getAverage();
     bool update(long new_rssi);
     long getCurrent() {
-      return current_rssi;
+      return current_rssi_cumulative_data_points_count
+             ? long(float(current_rssi_cumulative) / current_rssi_cumulative_data_points_count)
+             : 0;
     };
     void setTimespanForAverage(unsigned char seconds) {
       timespan_for_average_secs = seconds;
-      update_every_ms = (timespan_for_average_secs * 1000.0) / data_points_count;
+      data_points_count = seconds * DATAPOINTS_PER_SECOND;
+      if (data_points) delete [] data_points;
+      data_points = new long[data_points_count];
+      data_points_position = 0;
+      data_points_available = 0;
     };
     unsigned char getTimespanForAverage() {
       return timespan_for_average_secs;
     };
 };
 
-RSSIData::RSSIData(unsigned int data_points_count,
-                   unsigned char seconds_for_average): data_points_count(data_points_count) {
-  data_points = new long[this->data_points_count];
+RSSIData::RSSIData(unsigned char seconds_for_average) {
+  update_every_ms = 1000.0 / DATAPOINTS_PER_SECOND;
   setTimespanForAverage(seconds_for_average);
 }
 
@@ -90,8 +100,10 @@ float RSSIData::getAverage() {
 }
 
 bool RSSIData::update(long new_rssi) {
+  current_rssi_cumulative += new_rssi;
+  current_rssi_cumulative_data_points_count++;
   if (millis() >= next_update_due_ms) {
-    current_rssi = new_rssi;
+    current_rssi = getCurrent();
     data_points[data_points_position] = new_rssi;
     data_points_position = (data_points_position + 1) % data_points_count;
     if (data_points_available < data_points_count) {
@@ -99,21 +111,26 @@ bool RSSIData::update(long new_rssi) {
     }
     next_update_due_ms = update_every_ms + last_update_ms;
     last_update_ms = millis();
+    current_rssi_cumulative = 0;
+    current_rssi_cumulative_data_points_count = 0;
     return true;
   }
   return false;
 }
 
-
 Adafruit_SSD1306 display(OLED_RESET);
 long rssi;
-unsigned char percentCurrent = 0, percentAverage = 0;
-RSSIData rssi_data(50, 10);
+unsigned char percent_current = 0,
+              percent_average = 0,
+              seconds_for_average = 10,
+              analog_value;
+RSSIData rssi_data(seconds_for_average);
 bool updated = false;
 
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(ANALOG_PIN, INPUT);
   Serial.begin(115200);
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C); // initialize with the I2C addr 0x3C (for the 128x32)
@@ -138,29 +155,56 @@ void setup() {
   display.display();
 }
 
+void drawScale() {
+  for (int i = 0; i < 100; i++) {
+    if (i % 25 == 0) {
+      display.drawFastVLine(int(i * WIDTH / 100.0), HEIGHT - 8, 8, WHITE);
+    } else if (i % 10 == 0) {
+      display.drawFastVLine(int(i * WIDTH / 100.0), HEIGHT - 2, 2, WHITE);
+    }
+  }
+}
 
 void loop() {
-  rssi = WiFi.RSSI();
-  updated = rssi_data.update(rssi);
-  if (updated) {
-    digitalWrite(LED_BUILTIN, LOW);  // internal led is active LOW
+  // leave a bit of space for the bounds
+  analog_value = constrain(map(analogRead(ANALOG_PIN), 24, 1000, 0, 5), 0, 5);
+  if (analog_value != seconds_for_average) {
+    seconds_for_average = analog_value;
+    rssi_data.setTimespanForAverage(SELECTABLE_TIMESPANS[seconds_for_average]);
   }
 
-  percentCurrent = dBmToPercent(rssi);
-  percentAverage = dBmToPercent(rssi_data.getAverage());
+  rssi = WiFi.RSSI();
+  updated = rssi_data.update(rssi);
 
-  Serial.print(String(percentAverage) + "\t");
-  Serial.println(String(percentCurrent));
+  percent_current = dBmToPercent(rssi);
+  percent_average = dBmToPercent(rssi_data.getAverage());
+
+  if (updated) {
+    /* instead of pwm, we use the tone function for lower frequencies for blinking the led
+      10 Hz is the slowest frequency in my tests (unlike the Arduino UNOs 31Hz) */
+    if (percent_average) {
+      tone(LED_BUILTIN, map(percent_average, 0, 100, 10, 32));
+    } else {
+      noTone(LED_BUILTIN);
+    }
+  }
+
+  Serial.print(String(percent_average) + "\t");
+  Serial.println(String(percent_current));
 
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.print(String(percentCurrent) + "% | AVG: ");
-  display.print(String(percentAverage) + "% (" + String(rssi_data.getTimespanForAverage()) + "s)");
-  display.drawFastHLine(0, HEIGHT - int(dBmToPercent(rssi) * HEIGHT / 100.0), WIDTH, WHITE);
+  display.print(String(percent_current) + "% | AVG: ");
+  display.print(String(percent_average) + "% (" + String(rssi_data.getTimespanForAverage()) + "s)");
+
+  drawScale();
+  display.drawFastVLine(int(WIDTH * percent_current / 100.0), 0, HEIGHT, INVERSE);
+  display.fillRect(0, 0, int(WIDTH * percent_average / 100.0), HEIGHT, INVERSE);
+
   display.display();
 
   delay(1);
-  digitalWrite(LED_BUILTIN, HIGH);
+  //digitalWrite(LED_BUILTIN, HIGH);
   delay(49);
 }
 
