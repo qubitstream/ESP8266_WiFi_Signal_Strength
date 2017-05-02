@@ -18,12 +18,14 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
-#include <vector>
+#include <deque>
+#include <numeric>
 #include <SPI.h>
 #include <ESP8266WiFi.h>
 #include <Adafruit_SSD1306.h>
 #include "wifi_credentials.h"
 
+// Constants
 const int WIDTH = 128;
 const int HEIGHT = 32;
 const unsigned char ANALOG_PIN = 0,
@@ -43,26 +45,20 @@ unsigned char dBmToPercent(long dBm) {
   return quality_percent;
 }
 
-
 class RSSIData {
   private:
     long current_rssi = 0;
     long current_rssi_cumulative = 0;
     unsigned int current_rssi_cumulative_data_points_count = 0,
                  data_points_count = 0,
-                 data_points_available = 0,
-                 data_points_position = 0,
                  update_every_ms = 100;
     unsigned long last_update_ms = 0,
                   next_update_due_ms = millis();
     unsigned char timespan_for_average_secs = 5;
-    long* data_points = nullptr;
+    std::deque<long> data_points;
 
   public:
     RSSIData(unsigned char seconds_for_average);
-    ~RSSIData() {
-      if (data_points) delete [] data_points;
-    };
     float getAverage();
     bool update(long new_rssi);
     long getCurrent() {
@@ -73,14 +69,14 @@ class RSSIData {
     void setTimespanForAverage(unsigned char seconds) {
       timespan_for_average_secs = seconds;
       data_points_count = seconds * DATAPOINTS_PER_SECOND;
-      if (data_points) delete [] data_points;
-      data_points = new long[data_points_count];
-      data_points_position = 0;
-      data_points_available = 0;
+      data_points.clear();
     };
     unsigned char getTimespanForAverage() {
       return timespan_for_average_secs;
     };
+    const std::deque<long>& getAverageData() {
+      return data_points;
+    }
 };
 
 RSSIData::RSSIData(unsigned char seconds_for_average) {
@@ -89,14 +85,9 @@ RSSIData::RSSIData(unsigned char seconds_for_average) {
 }
 
 float RSSIData::getAverage() {
-  if (data_points_available < 1) {
-    return 0.0;
-  }
-  long sum = 0;
-  for (unsigned int i = 0; i < data_points_available; i++) {
-    sum += data_points[i];
-  }
-  return float(sum) / data_points_available;
+  return data_points.size()
+         ? std::accumulate(data_points.begin(), data_points.end(), 0) / float(data_points.size())
+         : 0.0;
 }
 
 bool RSSIData::update(long new_rssi) {
@@ -104,11 +95,10 @@ bool RSSIData::update(long new_rssi) {
   current_rssi_cumulative_data_points_count++;
   if (millis() >= next_update_due_ms) {
     current_rssi = getCurrent();
-    data_points[data_points_position] = new_rssi;
-    data_points_position = (data_points_position + 1) % data_points_count;
-    if (data_points_available < data_points_count) {
-      data_points_available++;
+    if (data_points.size() >= data_points_count) {
+      data_points.pop_back();
     }
+    data_points.push_front(current_rssi);
     next_update_due_ms = update_every_ms + last_update_ms;
     last_update_ms = millis();
     current_rssi_cumulative = 0;
@@ -146,13 +136,38 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     digitalWrite(LED_BUILTIN, LOW);
+    display.drawFastVLine(WIDTH / 2, HEIGHT / 2 - 3, 6, INVERSE);
+    display.display();
     delay(250);
     digitalWrite(LED_BUILTIN, HIGH);
+    display.drawFastHLine(WIDTH / 2 - 3, HEIGHT / 2 - 3, 6, INVERSE);
+    display.display();
     delay(250);
   }
   Serial.println("success!");
   display.clearDisplay();
   display.display();
+}
+
+// a common Bresenham line drawing implementation
+void line(int x0, int y0, int x1, int y1, int color) {
+  int dx =  abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy, e2; /* error value e_xy */
+
+  while (1) {
+    display.drawPixel(x0, y0, color);
+    if (x0 == x1 && y0 == y1) break;
+    e2 = 2 * err;
+    if (e2 > dy) {
+      err += dy;  /* e_xy+e_x > 0 */
+      x0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;  /* e_xy+e_y < 0 */
+      y0 += sy;
+    }
+  }
 }
 
 void drawScale() {
@@ -162,6 +177,20 @@ void drawScale() {
     } else if (i % 10 == 0) {
       display.drawFastVLine(int(i * WIDTH / 100.0), HEIGHT - 2, 2, WHITE);
     }
+  }
+}
+
+void drawAverage() {
+  const std::deque<long>& data_points = rssi_data.getAverageData();
+  const float stepWidth = float(WIDTH) / data_points.size();
+  int i = 0, newY, lastY;
+  for (const auto& dp : data_points) {
+    newY = map(dBmToPercent(dp), 0, 100, HEIGHT - 1, 0);
+    if (i > 0) {
+      line(int(WIDTH - i * stepWidth), lastY, int(WIDTH - (i + 1) * stepWidth), newY, WHITE);
+    }
+    lastY = newY;
+    i++;
   }
 }
 
@@ -180,31 +209,33 @@ void loop() {
   percent_average = dBmToPercent(rssi_data.getAverage());
 
   if (updated) {
-    /* instead of pwm, we use the tone function for lower frequencies for blinking the led
-      10 Hz is the slowest frequency in my tests (unlike the Arduino UNOs 31Hz) */
+    /* instead of PWM, we use the tone function for lower frequencies for blinking the LED
+      10 Hz is the lowest frequency possible in my tests for the ESP8266 (lower than the Arduino UNOs 31 Hz) */
     if (percent_average) {
-      tone(LED_BUILTIN, map(percent_average, 0, 100, 10, 32));
+      tone(LED_BUILTIN, map(percent_average, 0, 100, 10, 26));
     } else {
       noTone(LED_BUILTIN);
     }
   }
 
   Serial.print(String(percent_average) + "\t");
-  Serial.println(String(percent_current));
+  Serial.println(percent_current);
 
   display.clearDisplay();
+
+  drawScale();
+  drawAverage();
+  display.drawFastVLine(int(WIDTH * percent_current / 100.0), 0, HEIGHT, INVERSE);
+  display.drawFastHLine(int(WIDTH * percent_current / 100.0) - 2, HEIGHT / 2, 5 , INVERSE);
+  display.fillRect(0, 0, int(WIDTH * percent_average / 100.0), HEIGHT, INVERSE);
+
   display.setCursor(0, 0);
+  display.setTextColor(INVERSE);
   display.print(String(percent_current) + "% | AVG: ");
   display.print(String(percent_average) + "% (" + String(rssi_data.getTimespanForAverage()) + "s)");
 
-  drawScale();
-  display.drawFastVLine(int(WIDTH * percent_current / 100.0), 0, HEIGHT, INVERSE);
-  display.fillRect(0, 0, int(WIDTH * percent_average / 100.0), HEIGHT, INVERSE);
-
   display.display();
 
-  delay(1);
-  //digitalWrite(LED_BUILTIN, HIGH);
-  delay(49);
+  delay(40);
 }
 
